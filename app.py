@@ -20,7 +20,7 @@ handler = WebhookHandler(LINE_SECRET)
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
 
-# 本地死侍黃金幹話庫（絕對不甩 Google 機房臉色，秒速回話！）
+# 本地死侍黃金幹話庫
 DEADPOOL_QUOTES = [
     "法克！你以為我是客服中心喔？一直敲我！不過看在你這麼帥的份上，我原諒你了。",
     "（一邊擦拭雙刀一邊翻白眼）老兄，今天天氣很好，適合去吃墨西哥捲餅（Chimichangas），別在這跟我廢話。",
@@ -56,22 +56,31 @@ def handle_text_message(event):
     user_msg = event.message.text.strip()
     chat_id = get_chat_id(event)
 
+    # 如果是在群組或多人聊天室
     if event.source.type in ["group", "room"]:
-        prefixes = ("死侍", "Deadpool", "deadpool", "@死侍")
-        if not user_msg.startswith(prefixes):
+        # 檢查是不是有被標註 (Mention) 或者文字裡包含喚醒詞
+        is_mentioned = False
+        if hasattr(event.message, 'mention') and event.message.mention and event.message.mention.mentionees:
+            is_mentioned = True
+            
+        keywords = ("死侍", "deadpool", "Deadpool", "@死侍")
+        has_keyword = any(k in user_msg for k in keywords)
+
+        # 既沒有被@選單點名，句子裡也沒出現關鍵字，就直接默默潛水不回話
+        if not (is_mentioned or has_keyword):
             return
-        for p in prefixes:
-            if user_msg.startswith(p):
-                user_msg = user_msg[len(p):].strip(" ，,：:！")
-                break
+
+        # 清除訊息裡的喚醒詞，讓回話更自然
+        for k in keywords:
+            user_msg = user_msg.replace(k, "").strip()
+        
         if not user_msg:
-            user_msg = "（拍拍死侍的肩膀）"
+            user_msg = "（挑了挑眉看著你）"
 
     if user_msg in ["失憶", "清除記憶", "忘掉一切"]:
         chat_memory[chat_id].clear()
         reply_text = "啪！我剛剛拿平底鍋砸了自己的頭，關於你們的黑歷史我全都忘光了。爽了吧？"
     else:
-        # 結合使用者訊息的專屬死侍式吐槽
         reply_text = f"你剛剛說「{user_msg}」對吧？老兄，{random.choice(DEADPOOL_QUOTES)}"
 
     send_line_reply(event.reply_token, reply_text)
