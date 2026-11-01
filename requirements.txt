@@ -3,3 +3,4 @@ gunicorn
 line-bot-sdk
 google-genai
 Pillow
+httpx[socks]
