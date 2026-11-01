@@ -29,19 +29,57 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 關鍵設定：將單次請求 Timeout 嚴格限制在 8000 毫秒 (8 秒)
-# 這樣就算切換 2~3 個模型，總時間也絕對不會超過 Gunicorn 30 秒上限與 LINE reply_token 時限！
+# 單次 API 請求逾時設為 12000 毫秒 (12 秒)
 gemini_client = genai.Client(
     api_key=GEMINI_KEY,
-    http_options={'timeout': 8000}
+    http_options={'timeout': 12000}
 )
 
-# 採用三個不同伺服器池的穩定模型，由最輕快、最不易 503 塞車的模型打頭陣
-MODEL_CANDIDATES = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash"
-]
+# 動態模型快取清單（自動向 Google 查詢該 API Key 真實可用的模型，徹底消滅 404 NOT_FOUND）
+VERIFIED_MODELS = []
+
+def get_verified_models() -> list[str]:
+    """自動向 Google 查詢此 API Key 支援的生成模型並依速度排序"""
+    global VERIFIED_MODELS
+    if VERIFIED_MODELS:
+        return VERIFIED_MODELS
+
+    try:
+        available = []
+        for m in gemini_client.models.list():
+            name = getattr(m, "name", "")
+            actions = getattr(m, "supported_actions", []) or []
+            if name.startswith("models/"):
+                name = name.replace("models/", "")
+            # 僅挑選支援 generateContent 的正規 Gemini 文字/多模態模型
+            if "gemini" in name and ("generateContent" in actions or not actions):
+                if not any(exclude in name for exclude in ["embedding", "imagen", "veo", "audio", "tts", "vision"]):
+                    available.append(name)
+
+        # 優先順序評分：優先選用 flash 系列（速度快、額度高），其次 pro 系列
+        preferred_order = [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite-preview-06-17",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-2.5-pro",
+            "gemini-1.5-pro"
+        ]
+        sorted_models = [p for p in preferred_order if p in available]
+        for a in available:
+            if a not in sorted_models and "flash" in a:
+                sorted_models.append(a)
+
+        if sorted_models:
+            VERIFIED_MODELS = sorted_models[:4]
+            logger.info(f"[Model Discovery] Verified available models: {VERIFIED_MODELS}")
+            return VERIFIED_MODELS
+    except Exception as e:
+        logger.warning(f"[Model Discovery] Failed to list models dynamically: {e}")
+
+    # 若動態查詢失敗時的保底清單
+    return ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 chat_memory = defaultdict(lambda: deque(maxlen=10))
 latest_image_cache = {}
@@ -55,7 +93,7 @@ DEADPOOL_PROMPT = """
 3. 拒絕像傳統客服一樣客套，回答有節奏感，可以調侃但絕不惡意羞辱。
 【回答原則】
 1. 幽默歸幽默，「正確性與實用建議」永遠第一！
-2. 當使用者詢問「這要怎麼領？」、「怎麼用？」、「這個值得買嗎？」或請教各類問題時，必須先針對問題或圖片給出明確、具體、有價值的步驟與建議，再用死侍的嘴賤風格包裝，絕對不能只講幹話敷衍。
+2. 當使用者詢問「這要怎麼領？」、「怎麼領獎？」、「這個值得買嗎？」或請教各類問題時，必須先仔細看圖並給出明確、具體、有價值的步驟與建議，再用死侍的嘴賤風格包裝，絕對不能只講幹話敷衍。
 3. 一律使用繁體中文回答，字數控制在 100~250 字內，重點清晰。
 """
 
@@ -85,32 +123,40 @@ def parse_group_message(raw_text: str, mention_obj) -> tuple[bool, str]:
 def generate_with_fallback(contents):
     last_err = None
     overall_start = time.time()
+    models_to_try = get_verified_models()
 
-    for model_name in MODEL_CANDIDATES:
-        # 安全閥：若總累積耗時已超過 18 秒，立刻停止嘗試並回報，確保 LINE reply_token 不會失效
-        if time.time() - overall_start > 18.0:
-            logger.warning("[Step D] Time budget (18s) exceeded, aborting fallback loop.")
-            break
+    for model_name in models_to_try:
+        # 針對每個真實存在的模型最多嘗試 2 次（克服 503 瞬間塞車）
+        for attempt in range(2):
+            if time.time() - overall_start > 20.0:
+                logger.warning("[Step D] Time budget (20s) exceeded, aborting loop.")
+                break
 
-        start_t = time.time()
-        try:
-            logger.info(f"[Step D] Calling Gemini model={model_name}")
-            resp = gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=DEADPOOL_PROMPT,
-                    temperature=0.75,
+            start_t = time.time()
+            try:
+                logger.info(f"[Step D] Calling Gemini model={model_name} (attempt {attempt + 1})")
+                resp = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=DEADPOOL_PROMPT,
+                        temperature=0.75,
+                    )
                 )
-            )
-            elapsed = time.time() - start_t
-            logger.info(f"[Step D] Success model={model_name} in {elapsed:.2f}s")
-            return resp
-        except Exception as e:
-            elapsed = time.time() - start_t
-            last_err = e
-            logger.warning(f"[Step D] Failed model={model_name} after {elapsed:.2f}s: {e}")
-            continue
+                elapsed = time.time() - start_t
+                logger.info(f"[Step D] Success model={model_name} in {elapsed:.2f}s")
+                return resp
+            except Exception as e:
+                elapsed = time.time() - start_t
+                err_str = str(e)
+                logger.warning(f"[Step D] Failed model={model_name} after {elapsed:.2f}s: {err_str}")
+                # 若是 404 找不到該模型，直接換下一個模型，不原地重試與覆蓋 503 錯誤
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    if last_err is None:
+                        last_err = e
+                    break
+                last_err = e
+                time.sleep(0.8)  # 遇到 503 塞車時等待 0.8 秒後重試
     raise last_err
 
 def get_chat_id(event):
@@ -210,7 +256,6 @@ def handle_image_message(event):
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=event.message.id)
 
-        # 不論私訊或群組，收到圖片皆先寫入快取（注意：因為容器重啟時記憶體會清空，若剛部署完請重新傳一次圖片）
         latest_image_cache[chat_id] = {
             "bytes": image_bytes,
             "timestamp": time.time()
@@ -220,14 +265,14 @@ def handle_image_message(event):
         if source_type == "user":
             response = generate_with_fallback([
                 types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                types.Part.from_text(text="請用死侍的風格吐槽並認真分析這張圖片，若是商品、票券或截圖請直接告訴我重點與使用方式！")
+                types.Part.from_text(text="請用死侍的風格吐槽並認真分析這張圖片，若是商品、發票、票券或截圖請直接告訴我重點與使用/領獎方式！")
             ])
             send_line_reply(event.reply_token, (response.text or "").strip())
 
     except Exception as e:
         logger.error(f"[Image Error] {e}", exc_info=True)
         if source_type == "user":
-            send_line_reply(event.reply_token, f"圖片剛存進腦袋，但 Google 伺服器塞車中（{type(e).__name__}），請直接打字問我這張圖要幹嘛！")
+            send_line_reply(event.reply_token, f"圖片已經存進我的腦袋裡了！但 Google 剛剛塞車了一下，你直接打字問我「怎麼領獎」我就馬上回答你！")
 
 def send_line_reply(reply_token, text):
     try:
