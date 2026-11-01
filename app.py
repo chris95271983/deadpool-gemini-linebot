@@ -20,14 +20,15 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
-gemini_client = genai.Client(api_key=GEMINI_KEY)
+# 強制設定 10 秒逾時，絕不讓伺服器無限卡死
+gemini_client = genai.Client(
+    api_key=GEMINI_KEY,
+    http_options={'timeout': 10.0}
+)
 
-# 多車道備援清單：如果第一個塞車(503)或找不到(404)，自動切換下一個
 MODEL_CANDIDATES = [
     "gemini-3.8-flash",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-pro-latest"
+    "gemini-flash-latest"
 ]
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
@@ -49,30 +50,24 @@ DEADPOOL_PROMPT = """
 """
 
 def generate_with_fallback(contents):
-    """遇到 404 找不到或 503 伺服器塞車時，自動重試並切換備用模型"""
     last_err = None
     for model_name in MODEL_CANDIDATES:
-        for attempt in range(2):  # 每個模型最多試 2 次
-            try:
-                return gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=DEADPOOL_PROMPT,
-                        temperature=0.8,
-                    )
+        try:
+            return gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=DEADPOOL_PROMPT,
+                    temperature=0.8,
                 )
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                # 如果是 503 塞車，等 1 秒再試一次，或換下一個模型
-                if any(k in err_str for k in ["503", "UNAVAILABLE", "overloaded", "429"]):
-                    time.sleep(1)
-                    continue
-                # 如果是 404 找不到該模型，直接跳過換下一個模型
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    break
-                raise e
+            )
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "404" in err_str or "NOT_FOUND" in err_str or "503" in err_str or "timeout" in err_str.lower():
+                time.sleep(1)
+                continue
+            raise e
     raise last_err
 
 def get_chat_id(event):
@@ -140,7 +135,7 @@ def handle_text_message(event):
         chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
 
     except Exception as e:
-        reply_text = f"法克，我的腦袋剛剛短路了（API 錯誤：{str(e)}），去叫工程師出來挨揍！"
+        reply_text = f"法克，我的腦袋連線超時了（錯誤：{str(e)[:60]}），去叫工程師出來挨揍！"
 
     send_line_reply(event.reply_token, reply_text)
 
@@ -164,7 +159,7 @@ def handle_image_message(event):
 
     except Exception as e:
         if event.source.type == "user":
-            send_line_reply(event.reply_token, f"我的眼睛業障重，看不清楚這張圖（錯誤：{str(e)}）")
+            send_line_reply(event.reply_token, f"我的眼睛業障重，看不清楚這張圖（錯誤：{str(e)[:60]}）")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
