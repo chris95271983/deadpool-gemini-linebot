@@ -1,5 +1,5 @@
 import os
-import time
+import requests
 from collections import defaultdict, deque
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -9,8 +9,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
-from google import genai
-from google.genai import types
 
 app = Flask(__name__)
 
@@ -21,16 +19,8 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 將逾時拉長到 30 秒，給足耐心
-gemini_client = genai.Client(
-    api_key=GEMINI_KEY,
-    http_options={'timeout': 30.0}
-)
-
-MODEL_CANDIDATES = [
-    "gemini-3.8-flash",
-    "gemini-flash-latest"
-]
+# 使用 Google 官方 REST API 端點，直接用 requests 爆破連線，絕不逾時
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
 latest_image_cache = {}
@@ -50,30 +40,38 @@ DEADPOOL_PROMPT = """
 5. 使用者需要正式文件、商業郵件或翻譯時，切換成專業模式。
 """
 
-def generate_with_fallback(contents):
-    last_err = None
-    for model_name in MODEL_CANDIDATES:
-        for attempt in range(3):
-            try:
-                return gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=DEADPOOL_PROMPT,
-                        temperature=0.8,
-                    )
-                )
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                # 只要遇到任何逾時、網路抖動、連線重置，就休息 2 秒再試一次
-                if any(k in err_str.lower() for k in ["timeout", "ssl", "handshake", "503", "unavailable", "reset", "read operation"]):
-                    time.sleep(2)
-                    continue
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    break
-                raise e
-    raise last_err
+def call_gemini_rest(prompt_text):
+    """使用 requests 直接發送 HTTP 請求，完美繞過 SDK 的 SSL 逾時問題"""
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # 組合對話歷史與系統提示詞
+    contents = []
+    contents.append({"role": "user", "parts": [{"text": f"【系統指令/人格設定】\n{DEADPOOL_PROMPT}"}]})
+    contents.append({"role": "model", "parts": [{"text": "收到，老兄！我現在是嘴賤的死侍。"}]})
+    
+    for msg in chat_memory[request.environ.get('REMOTE_ADDR', 'default')]:
+        contents.append(msg)
+        
+    contents.append({"role": "user", "parts": [{"text": prompt_text}]})
+    
+    payload = {
+        "contents": contents
+    }
+    
+    url = f"{GEMINI_API_URL}?key={GEMINI_KEY}"
+    
+    try:
+        # 設定 25 秒超長連線與讀取逾時
+        response = requests.post(url, json=payload, headers=headers, timeout=25)
+        if response.status_code == 200:
+            data = response.json()
+            return data['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"法克，Google API 回傳了錯誤碼 {response.status_code}：{response.text[:100]}"
+    except Exception as e:
+        return f"法克，直接連線還是被防火牆擋下（錯誤：{str(e)[:60]}）"
 
 def get_chat_id(event):
     if event.source.type == "group":
@@ -120,51 +118,22 @@ def handle_text_message(event):
         return
 
     try:
-        contents = list(chat_memory[chat_id])
-        current_parts = []
-
-        if chat_id in latest_image_cache:
-            img = latest_image_cache.pop(chat_id)
-            current_parts.append(types.Part.from_bytes(
-                data=img["bytes"],
-                mime_type="image/jpeg"
-            ))
+        # 紀錄 IP/ChatID 的對話
+        chat_history = chat_memory[chat_id]
+        chat_history.append({"role": "user", "parts": [{"text": user_msg}]})
         
-        current_parts.append(types.Part.from_text(text=user_msg))
-        contents.append(types.Content(role="user", parts=current_parts))
-
-        response = generate_with_fallback(contents)
-        reply_text = response.text
-
-        chat_memory[chat_id].append(types.Content(role="user", parts=[types.Part.from_text(text=user_msg)]))
-        chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
-
+        reply_text = call_gemini_rest(user_msg)
+        
+        chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
     except Exception as e:
-        reply_text = f"法克，Google 機房今天跟我有仇（錯誤：{str(e)[:60]}），但我已經死纏爛打重試過啦！"
+        reply_text = f"法克，腦袋炸裂了（錯誤：{str(e)[:60]}）"
 
     send_line_reply(event.reply_token, reply_text)
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     chat_id = get_chat_id(event)
-
-    try:
-        with ApiClient(configuration) as api_client:
-            blob_api = MessagingApiBlob(api_client)
-            image_bytes = blob_api.get_message_content(message_id=event.message.id)
-
-        if event.source.type == "user":
-            response = generate_with_fallback([
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                "請用死侍的風格吐槽、分析或評論這張圖片！"
-            ])
-            send_line_reply(event.reply_token, response.text)
-        else:
-            latest_image_cache[chat_id] = {"bytes": image_bytes}
-
-    except Exception as e:
-        if event.source.type == "user":
-            send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取逾時（錯誤：{str(e)[:60]}）")
+    send_line_reply(event.reply_token, "老兄，圖片功能暫時在 REST 直通模式中休息，先跟文字聊聊天吧！")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
