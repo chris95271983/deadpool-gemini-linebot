@@ -21,10 +21,10 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 設定 15 秒逾時
+# 將逾時拉長到 30 秒，給足耐心
 gemini_client = genai.Client(
     api_key=GEMINI_KEY,
-    http_options={'timeout': 15.0}
+    http_options={'timeout': 30.0}
 )
 
 MODEL_CANDIDATES = [
@@ -53,7 +53,6 @@ DEADPOOL_PROMPT = """
 def generate_with_fallback(contents):
     last_err = None
     for model_name in MODEL_CANDIDATES:
-        # 每個模型給它 3 次重試機會，專門對付 SSL 暫時性握手失敗
         for attempt in range(3):
             try:
                 return gemini_client.models.generate_content(
@@ -67,11 +66,10 @@ def generate_with_fallback(contents):
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                # 如果是逾時、SSL 錯誤或 503，暫停 1 秒後自動重試！
-                if any(k in err_str.lower() for k in ["timeout", "ssl", "handshake", "503", "unavailable", "reset"]):
-                    time.sleep(1)
+                # 只要遇到任何逾時、網路抖動、連線重置，就休息 2 秒再試一次
+                if any(k in err_str.lower() for k in ["timeout", "ssl", "handshake", "503", "unavailable", "reset", "read operation"]):
+                    time.sleep(2)
                     continue
-                # 如果是模型找不到(404)，直接換下一個模型
                 if "404" in err_str or "NOT_FOUND" in err_str:
                     break
                 raise e
@@ -142,7 +140,7 @@ def handle_text_message(event):
         chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
 
     except Exception as e:
-        reply_text = f"法克，網路連線又抽筋了（錯誤：{str(e)[:60]}），但我已經自動重試過啦！"
+        reply_text = f"法克，Google 機房今天跟我有仇（錯誤：{str(e)[:60]}），但我已經死纏爛打重試過啦！"
 
     send_line_reply(event.reply_token, reply_text)
 
@@ -166,7 +164,7 @@ def handle_image_message(event):
 
     except Exception as e:
         if event.source.type == "user":
-            send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取失敗（錯誤：{str(e)[:60]}）")
+            send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取逾時（錯誤：{str(e)[:60]}）")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
