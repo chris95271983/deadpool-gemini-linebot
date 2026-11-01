@@ -20,10 +20,11 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
-# 強制設定 10 秒逾時，絕不讓伺服器無限卡死
+
+# 設定 15 秒逾時
 gemini_client = genai.Client(
     api_key=GEMINI_KEY,
-    http_options={'timeout': 10.0}
+    http_options={'timeout': 15.0}
 )
 
 MODEL_CANDIDATES = [
@@ -52,22 +53,28 @@ DEADPOOL_PROMPT = """
 def generate_with_fallback(contents):
     last_err = None
     for model_name in MODEL_CANDIDATES:
-        try:
-            return gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=DEADPOOL_PROMPT,
-                    temperature=0.8,
+        # 每個模型給它 3 次重試機會，專門對付 SSL 暫時性握手失敗
+        for attempt in range(3):
+            try:
+                return gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=DEADPOOL_PROMPT,
+                        temperature=0.8,
+                    )
                 )
-            )
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            if "404" in err_str or "NOT_FOUND" in err_str or "503" in err_str or "timeout" in err_str.lower():
-                time.sleep(1)
-                continue
-            raise e
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # 如果是逾時、SSL 錯誤或 503，暫停 1 秒後自動重試！
+                if any(k in err_str.lower() for k in ["timeout", "ssl", "handshake", "503", "unavailable", "reset"]):
+                    time.sleep(1)
+                    continue
+                # 如果是模型找不到(404)，直接換下一個模型
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                raise e
     raise last_err
 
 def get_chat_id(event):
@@ -135,7 +142,7 @@ def handle_text_message(event):
         chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
 
     except Exception as e:
-        reply_text = f"法克，我的腦袋連線超時了（錯誤：{str(e)[:60]}），去叫工程師出來挨揍！"
+        reply_text = f"法克，網路連線又抽筋了（錯誤：{str(e)[:60]}），但我已經自動重試過啦！"
 
     send_line_reply(event.reply_token, reply_text)
 
@@ -159,7 +166,7 @@ def handle_image_message(event):
 
     except Exception as e:
         if event.source.type == "user":
-            send_line_reply(event.reply_token, f"我的眼睛業障重，看不清楚這張圖（錯誤：{str(e)[:60]}）")
+            send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取失敗（錯誤：{str(e)[:60]}）")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
