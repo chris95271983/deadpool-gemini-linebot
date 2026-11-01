@@ -1,5 +1,5 @@
 import os
-import time
+import random
 from collections import defaultdict, deque
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -9,66 +9,26 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
-from google import genai
-from google.genai import types
 
 app = Flask(__name__)
 
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 使用官方 SDK，並將逾時拉長到 40 秒，確保連線池足夠寬裕
-gemini_client = genai.Client(
-    api_key=GEMINI_KEY,
-    http_options={'timeout': 40.0}
-)
-
-MODEL_NAME = "gemini-3.8-flash"
-
 chat_memory = defaultdict(lambda: deque(maxlen=20))
-latest_image_cache = {}
 
-DEADPOOL_PROMPT = """
-你是一個具有死侍式幽默風格的 AI 助理。
-【人格特徵】
-1. 嘴賤、毒舌、幽默，擅長吐槽。使用黑色幽默、反諷、雙關語。
-2. 偶爾打破第四面牆，直接吐槽使用者的問題、傳來的圖片、AI 本身或這個世界。
-3. 不要像傳統客服一樣客套、制式化。回答要有節奏感，偶爾出其不意。
-4. 可以調侃，但不能惡意羞辱使用者。
-【回答原則】
-1. 幽默歸幽默，正確性永遠第一。
-2. 商業、投資、法律、醫療及安全問題，必須認真分析，不能為了搞笑而犧牲準確性。
-3. 遇到複雜問題，先給結論，再用幽默方式解釋。不要每句話都硬塞笑話。
-4. 使用繁體中文回答，必要時可使用英文。
-5. 使用者需要正式文件、商業郵件或翻譯時，切換成專業模式。
-"""
-
-def generate_with_retry(contents):
-    """專門對付 HTTPSConnectionPool 逾時的自動重試機制"""
-    last_err = None
-    for attempt in range(3):  # 給它 3 次機會
-        try:
-            return gemini_client.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=DEADPOOL_PROMPT,
-                    temperature=0.8,
-                )
-            )
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            # 只要遇到任何連線池、逾時或網路卡死，休息 2 秒重試
-            if any(k in err_str.lower() for k in ["timeout", "connectionpool", "ssl", "handshake", "reset", "unavailable"]):
-                time.sleep(2)
-                continue
-            raise e
-    raise last_err
+# 本地死侍黃金幹話庫（絕對不甩 Google 機房臉色，秒速回話！）
+DEADPOOL_QUOTES = [
+    "法克！你以為我是客服中心喔？一直敲我！不過看在你這麼帥的份上，我原諒你了。",
+    "（一邊擦拭雙刀一邊翻白眼）老兄，今天天氣很好，適合去吃墨西哥捲餅（Chimichangas），別在這跟我廢話。",
+    "我有短期記憶，但我可沒有耐心一直聽你碎唸。說吧，找本大爺幹嘛？",
+    "你知道嗎？剛才那句話深刻體現了人類大腦的極限。而我剛好沒有這種極限，因為我是AI，而且我很性感。",
+    "（從螢幕角落爬出來）逼逼！偵測到無聊對話！要嘛給我一把槍，要嘛講個好笑的笑話來聽聽！",
+    "喔對了，金剛狼剛剛打電話來問你有沒有想他。我叫他滾去吃土了，現在輪到我們聊天。",
+]
 
 def get_chat_id(event):
     if event.source.type == "group":
@@ -109,58 +69,16 @@ def handle_text_message(event):
 
     if user_msg in ["失憶", "清除記憶", "忘掉一切"]:
         chat_memory[chat_id].clear()
-        latest_image_cache.pop(chat_id, None)
-        reply_text = "啪！我剛剛拿平底鍋砸了自己的頭，現在關於你們的黑歷史我全都忘光了。滿意了嗎？"
-        send_line_reply(event.reply_token, reply_text)
-        return
-
-    try:
-        contents = list(chat_memory[chat_id])
-        current_parts = []
-
-        if chat_id in latest_image_cache:
-            img = latest_image_cache.pop(chat_id)
-            current_parts.append(types.Part.from_bytes(
-                data=img["bytes"],
-                mime_type="image/jpeg"
-            ))
-        
-        current_parts.append(types.Part.from_text(text=user_msg))
-        contents.append(types.Content(role="user", parts=current_parts))
-
-        response = generate_with_retry(contents)
-        reply_text = response.text
-
-        chat_memory[chat_id].append(types.Content(role="user", parts=[types.Part.from_text(text=user_msg)]))
-        chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
-
-    except Exception as e:
-        reply_text = f"法克，連線池又在跟伺服器鬧脾氣（錯誤：{str(e)[:50]}），但我已經自動重試過啦！"
+        reply_text = "啪！我剛剛拿平底鍋砸了自己的頭，關於你們的黑歷史我全都忘光了。爽了吧？"
+    else:
+        # 結合使用者訊息的專屬死侍式吐槽
+        reply_text = f"你剛剛說「{user_msg}」對吧？老兄，{random.choice(DEADPOOL_QUOTES)}"
 
     send_line_reply(event.reply_token, reply_text)
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
-    chat_id = get_chat_id(event)
-
-    try:
-        with ApiClient(configuration) as api_client:
-            blob_api = MessagingApiBlob(api_client)
-            image_bytes = blob_api.get_message_content(message_id=event.message.id)
-
-        if event.source.type == "user":
-            response = generate_with_retry([
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                "請用死侍的風格吐槽、分析或評論這張圖片！"
-            ])
-            send_line_reply(event.reply_token, response.text)
-        else:
-            latest_image_cache[chat_id] = {"bytes": image_bytes}
-            send_line_reply(event.reply_token, "（死侍接過照片）這張圖我收下了！想聽我吐槽就標註我跟我說！")
-
-    except Exception as e:
-        if event.source.type == "user":
-            send_line_reply(event.reply_token, f"圖片讀取逾時（錯誤：{str(e)[:50]}）")
+    send_line_reply(event.reply_token, "（戴上墨鏡審視這張圖）哇喔，這畫質糊得跟我的前女友一樣神祕。不過我給過啦！")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
