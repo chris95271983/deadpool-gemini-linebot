@@ -29,10 +29,10 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 單次 API 請求逾時設為 12000 毫秒 (12 秒)
+# 單次 API 請求逾時拉長為 25000 毫秒 (25 秒)，給圖片運算充足的時間
 gemini_client = genai.Client(
     api_key=GEMINI_KEY,
-    http_options={'timeout': 12000}
+    http_options={'timeout': 25000}
 )
 
 # 動態模型快取清單（自動向 Google 查詢該 API Key 真實可用的模型，徹底消滅 404 NOT_FOUND）
