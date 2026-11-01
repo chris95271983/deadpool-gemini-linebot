@@ -1,4 +1,5 @@
 import os
+import time
 from collections import defaultdict, deque
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -21,8 +22,13 @@ configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-# 優先使用官方提示的 gemini-3.8-flash，若未來改版則自動退回通用最新別名
-MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-flash-latest"]
+# 多車道備援清單：如果第一個塞車(503)或找不到(404)，自動切換下一個
+MODEL_CANDIDATES = [
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-pro-latest"
+]
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
 latest_image_cache = {}
@@ -43,23 +49,30 @@ DEADPOOL_PROMPT = """
 """
 
 def generate_with_fallback(contents):
-    """自動嘗試模型清單，再也不怕 Google 偷改模型名字"""
+    """遇到 404 找不到或 503 伺服器塞車時，自動重試並切換備用模型"""
     last_err = None
     for model_name in MODEL_CANDIDATES:
-        try:
-            return gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=DEADPOOL_PROMPT,
-                    temperature=0.8,
+        for attempt in range(2):  # 每個模型最多試 2 次
+            try:
+                return gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=DEADPOOL_PROMPT,
+                        temperature=0.8,
+                    )
                 )
-            )
-        except Exception as e:
-            last_err = e
-            if "404" in str(e) or "NOT_FOUND" in str(e):
-                continue
-            raise e
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # 如果是 503 塞車，等 1 秒再試一次，或換下一個模型
+                if any(k in err_str for k in ["503", "UNAVAILABLE", "overloaded", "429"]):
+                    time.sleep(1)
+                    continue
+                # 如果是 404 找不到該模型，直接跳過換下一個模型
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                raise e
     raise last_err
 
 def get_chat_id(event):
