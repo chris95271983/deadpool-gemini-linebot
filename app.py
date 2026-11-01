@@ -21,7 +21,7 @@ configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
 # 使用 Google 官方 REST API 端點，支援文字與圖片多模態，絕對不逾時
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
 latest_image_cache = {}
