@@ -21,8 +21,8 @@ configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-# 請確認這裡的名稱與 LINE 錯誤訊息提示的 models/... 後面那串字相同
-MODEL_NAME = "gemini-3.0-flash"
+# 優先使用官方提示的 gemini-3.8-flash，若未來改版則自動退回通用最新別名
+MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-flash-latest"]
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
 latest_image_cache = {}
@@ -41,6 +41,26 @@ DEADPOOL_PROMPT = """
 4. 使用繁體中文回答，必要時可使用英文。
 5. 使用者需要正式文件、商業郵件或翻譯時，切換成專業模式。
 """
+
+def generate_with_fallback(contents):
+    """自動嘗試模型清單，再也不怕 Google 偷改模型名字"""
+    last_err = None
+    for model_name in MODEL_CANDIDATES:
+        try:
+            return gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=DEADPOOL_PROMPT,
+                    temperature=0.8,
+                )
+            )
+        except Exception as e:
+            last_err = e
+            if "404" in str(e) or "NOT_FOUND" in str(e):
+                continue
+            raise e
+    raise last_err
 
 def get_chat_id(event):
     if event.source.type == "group":
@@ -100,14 +120,7 @@ def handle_text_message(event):
         current_parts.append(types.Part.from_text(text=user_msg))
         contents.append(types.Content(role="user", parts=current_parts))
 
-        response = gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=DEADPOOL_PROMPT,
-                temperature=0.8,
-            )
-        )
+        response = generate_with_fallback(contents)
         reply_text = response.text
 
         chat_memory[chat_id].append(types.Content(role="user", parts=[types.Part.from_text(text=user_msg)]))
@@ -128,17 +141,10 @@ def handle_image_message(event):
             image_bytes = blob_api.get_message_content(message_id=event.message.id)
 
         if event.source.type == "user":
-            response = gemini_client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    "請用死侍的風格吐槽、分析或評論這張圖片！"
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=DEADPOOL_PROMPT,
-                    temperature=0.8,
-                )
-            )
+            response = generate_with_fallback([
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                "請用死侍的風格吐槽、分析或評論這張圖片！"
+            ])
             send_line_reply(event.reply_token, response.text)
         else:
             latest_image_cache[chat_id] = {"bytes": image_bytes}
