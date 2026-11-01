@@ -13,7 +13,6 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# 讀取環境變數中的三把鑰匙
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -22,13 +21,12 @@ configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-# 【升級 1：短期記憶庫】每個聊天室記住最近 10 輪對話（20 句話）
-chat_memory = defaultdict(lambda: deque(maxlen=20))
+# 請確認這裡的名稱與 LINE 錯誤訊息提示的 models/... 後面那串字相同
+MODEL_NAME = "gemini-3.0-flash"
 
-# 【升級 2：圖片暫存區】記住每個聊天室剛剛傳的最後一張圖片
+chat_memory = defaultdict(lambda: deque(maxlen=20))
 latest_image_cache = {}
 
-# 死侍專屬人格設定
 DEADPOOL_PROMPT = """
 你是一個具有死侍式幽默風格的 AI 助理。
 【人格特徵】
@@ -45,14 +43,12 @@ DEADPOOL_PROMPT = """
 """
 
 def get_chat_id(event):
-    """取得聊天室的唯一 ID（區分不同群組與個人私訊）"""
     if event.source.type == "group":
         return event.source.group_id
     elif event.source.type == "room":
         return event.source.room_id
     return event.source.user_id
 
-# 【升級 3：防休眠專屬通道】給 UptimeRobot 定時喚醒用
 @app.route("/ping", methods=['GET'])
 def ping():
     return "Deadpool is awake and eating chimichangas!", 200
@@ -67,13 +63,11 @@ def callback():
         abort(400)
     return 'OK'
 
-# 處理「文字訊息」
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     user_msg = event.message.text.strip()
     chat_id = get_chat_id(event)
 
-    # 群組防吵機制：在群組裡開頭必須叫「死侍」才觸發（私訊則有問必答）
     if event.source.type in ["group", "room"]:
         prefixes = ("死侍", "Deadpool", "deadpool", "@死侍")
         if not user_msg.startswith(prefixes):
@@ -85,7 +79,6 @@ def handle_text_message(event):
         if not user_msg:
             user_msg = "（拍拍死侍的肩膀）"
 
-    # 特殊指令：清除記憶與圖片暫存
     if user_msg in ["失憶", "清除記憶", "忘掉一切"]:
         chat_memory[chat_id].clear()
         latest_image_cache.pop(chat_id, None)
@@ -94,11 +87,9 @@ def handle_text_message(event):
         return
 
     try:
-        # 載入該聊天室的歷史對話紀錄
         contents = list(chat_memory[chat_id])
         current_parts = []
 
-        # 檢查該聊天室有沒有剛傳過來的圖片
         if chat_id in latest_image_cache:
             img = latest_image_cache.pop(chat_id)
             current_parts.append(types.Part.from_bytes(
@@ -109,9 +100,8 @@ def handle_text_message(event):
         current_parts.append(types.Part.from_text(text=user_msg))
         contents.append(types.Content(role="user", parts=current_parts))
 
-        # 呼叫 Gemini 2.5 Flash
         response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=MODEL_NAME,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=DEADPOOL_PROMPT,
@@ -120,7 +110,6 @@ def handle_text_message(event):
         )
         reply_text = response.text
 
-        # 將本輪對話存入短期記憶庫（僅存文字以節省記憶體）
         chat_memory[chat_id].append(types.Content(role="user", parts=[types.Part.from_text(text=user_msg)]))
         chat_memory[chat_id].append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
 
@@ -129,7 +118,6 @@ def handle_text_message(event):
 
     send_line_reply(event.reply_token, reply_text)
 
-# 處理「圖片訊息」
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     chat_id = get_chat_id(event)
@@ -139,10 +127,9 @@ def handle_image_message(event):
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=event.message.id)
 
-        # 個人私訊：傳圖直接吐槽
         if event.source.type == "user":
             response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=MODEL_NAME,
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                     "請用死侍的風格吐槽、分析或評論這張圖片！"
@@ -154,7 +141,6 @@ def handle_image_message(event):
             )
             send_line_reply(event.reply_token, response.text)
         else:
-            # 群組聊天：先把圖片暫存起來，等有人喊「死侍」再連圖帶字一起處理
             latest_image_cache[chat_id] = {"bytes": image_bytes}
 
     except Exception as e:
