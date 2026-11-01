@@ -1,4 +1,5 @@
 import os
+import base64
 import requests
 from collections import defaultdict, deque
 from flask import Flask, request, abort
@@ -19,7 +20,7 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# 使用 Google 官方 REST API 端點，直接用 requests 爆破連線，絕不逾時
+# 使用 Google 官方 REST API 端點，支援文字與圖片多模態，絕對不逾時
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 chat_memory = defaultdict(lambda: deque(maxlen=20))
@@ -40,30 +41,29 @@ DEADPOOL_PROMPT = """
 5. 使用者需要正式文件、商業郵件或翻譯時，切換成專業模式。
 """
 
-def call_gemini_rest(prompt_text):
-    """使用 requests 直接發送 HTTP 請求，完美繞過 SDK 的 SSL 逾時問題"""
-    headers = {
-        "Content-Type": "application/json"
-    }
+def call_gemini_rest(prompt_text, image_bytes=None):
+    headers = {"Content-Type": "application/json"}
     
-    # 組合對話歷史與系統提示詞
-    contents = []
-    contents.append({"role": "user", "parts": [{"text": f"【系統指令/人格設定】\n{DEADPOOL_PROMPT}"}]})
-    contents.append({"role": "model", "parts": [{"text": "收到，老兄！我現在是嘴賤的死侍。"}]})
+    parts = []
+    # 夾帶圖片資料（如果有傳圖片）
+    if image_bytes:
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": image_base64
+            }
+        })
     
-    for msg in chat_memory[request.environ.get('REMOTE_ADDR', 'default')]:
-        contents.append(msg)
-        
-    contents.append({"role": "user", "parts": [{"text": prompt_text}]})
+    parts.append({"text": f"【系統指令/人格設定】\n{DEADPOOL_PROMPT}\n\n使用者訊息：{prompt_text}"})
     
     payload = {
-        "contents": contents
+        "contents": [{"parts": parts}]
     }
     
     url = f"{GEMINI_API_URL}?key={GEMINI_KEY}"
     
     try:
-        # 設定 25 秒超長連線與讀取逾時
         response = requests.post(url, json=payload, headers=headers, timeout=25)
         if response.status_code == 200:
             data = response.json()
@@ -71,7 +71,7 @@ def call_gemini_rest(prompt_text):
         else:
             return f"法克，Google API 回傳了錯誤碼 {response.status_code}：{response.text[:100]}"
     except Exception as e:
-        return f"法克，直接連線還是被防火牆擋下（錯誤：{str(e)[:60]}）"
+        return f"法克，連線逾時（錯誤：{str(e)[:60]}）"
 
 def get_chat_id(event):
     if event.source.type == "group":
@@ -118,13 +118,9 @@ def handle_text_message(event):
         return
 
     try:
-        # 紀錄 IP/ChatID 的對話
-        chat_history = chat_memory[chat_id]
-        chat_history.append({"role": "user", "parts": [{"text": user_msg}]})
-        
-        reply_text = call_gemini_rest(user_msg)
-        
-        chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
+        # 檢查有沒有剛剛暫存的圖片（群組互動用）
+        img_bytes = latest_image_cache.pop(chat_id, None)
+        reply_text = call_gemini_rest(user_msg, image_bytes=img_bytes)
     except Exception as e:
         reply_text = f"法克，腦袋炸裂了（錯誤：{str(e)[:60]}）"
 
@@ -133,7 +129,20 @@ def handle_text_message(event):
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     chat_id = get_chat_id(event)
-    send_line_reply(event.reply_token, "老兄，圖片功能暫時在 REST 直通模式中休息，先跟文字聊聊天吧！")
+
+    try:
+        with ApiClient(configuration) as api_client:
+            blob_api = MessagingApiBlob(api_client)
+            image_bytes = blob_api.get_message_content(message_id=event.message.id)
+
+        if event.source.type == "user":
+            reply_text = call_gemini_rest("請用死侍的風格吐槽、分析或評論這張圖片！", image_bytes=image_bytes)
+            send_line_reply(event.reply_token, reply_text)
+        else:
+            latest_image_cache[chat_id] = image_bytes
+            send_line_reply(event.reply_token, "（死侍接過照片，挑了挑眉）這張圖我收下了！想聽我怎麼吐槽它嗎？快標註我的名字跟我說！")
+    except Exception as e:
+        send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取失敗（錯誤：{str(e)[:60]}）")
 
 def send_line_reply(reply_token, text):
     with ApiClient(configuration) as api_client:
