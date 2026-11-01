@@ -29,24 +29,23 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
-# timeout 單位為毫秒 (ms)，20000 = 20 秒
+# 關鍵設定：將單次請求 Timeout 嚴格限制在 8000 毫秒 (8 秒)
+# 這樣就算切換 2~3 個模型，總時間也絕對不會超過 Gunicorn 30 秒上限與 LINE reply_token 時限！
 gemini_client = genai.Client(
     api_key=GEMINI_KEY,
-    http_options={'timeout': 20000}
+    http_options={'timeout': 8000}
 )
 
-# 擴充全系列備援模型，避開單一模型 503 ServerError 塞車
+# 採用三個不同伺服器池的穩定模型，由最輕快、最不易 503 塞車的模型打頭陣
 MODEL_CANDIDATES = [
-    "gemini-3.8-flash",
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-flash-latest"
+    "gemini-2.5-flash"
 ]
 
 chat_memory = defaultdict(lambda: deque(maxlen=10))
 latest_image_cache = {}
-IMAGE_CACHE_TTL = 600  # 圖片暫存 10 分鐘（支援私訊與群組先傳圖、後提問）
+IMAGE_CACHE_TTL = 600  # 圖片暫存 10 分鐘
 
 DEADPOOL_PROMPT = """
 你是一個具有死侍（Deadpool）幽默風格的 AI 助理，在 LINE 裡的名稱是「死侍AI搭檔」。
@@ -85,7 +84,14 @@ def parse_group_message(raw_text: str, mention_obj) -> tuple[bool, str]:
 
 def generate_with_fallback(contents):
     last_err = None
+    overall_start = time.time()
+
     for model_name in MODEL_CANDIDATES:
+        # 安全閥：若總累積耗時已超過 18 秒，立刻停止嘗試並回報，確保 LINE reply_token 不會失效
+        if time.time() - overall_start > 18.0:
+            logger.warning("[Step D] Time budget (18s) exceeded, aborting fallback loop.")
+            break
+
         start_t = time.time()
         try:
             logger.info(f"[Step D] Calling Gemini model={model_name}")
@@ -104,7 +110,6 @@ def generate_with_fallback(contents):
             elapsed = time.time() - start_t
             last_err = e
             logger.warning(f"[Step D] Failed model={model_name} after {elapsed:.2f}s: {e}")
-            time.sleep(0.4)
             continue
     raise last_err
 
@@ -163,7 +168,6 @@ def handle_text_message(event):
         contents = list(chat_memory[chat_id])
         current_parts = []
 
-        # 無論是私訊還是在群組，只要 10 分鐘內有傳過圖片，追問時都會自動帶入該圖片！
         if chat_id in latest_image_cache:
             img_data = latest_image_cache.get(chat_id)
             if time.time() - img_data["timestamp"] <= IMAGE_CACHE_TTL:
@@ -183,7 +187,6 @@ def handle_text_message(event):
         if not reply_text:
             reply_text = "（死侍盯著螢幕看了三秒）老兄，這個問題太奇葩，連我的腦細胞都暫時罷工了，換個問法吧！"
 
-        # 成功針對圖片回答過後，若是在群組則清除圖片快取；私訊可保留供連續追問「怎麼用？」
         if source_type in ["group", "room"]:
             latest_image_cache.pop(chat_id, None)
 
@@ -192,7 +195,7 @@ def handle_text_message(event):
 
     except Exception as e:
         logger.error(f"[Step D Error] {e}", exc_info=True)
-        reply_text = f"法克，腦袋連線卡住了（{type(e).__name__}: {str(e)[:80]}）"
+        reply_text = f"法克，Google 伺服器現在大塞車（{type(e).__name__}: {str(e)[:70]}），過幾秒再敲我一次！"
 
     send_line_reply(event.reply_token, reply_text)
 
@@ -207,7 +210,7 @@ def handle_image_message(event):
             blob_api = MessagingApiBlob(api_client)
             image_bytes = blob_api.get_message_content(message_id=event.message.id)
 
-        # 不管是私訊還是群組，收到圖片時一律先寫入快取（這樣後續追問「這要怎麼領/怎麼用?」都看得到圖！）
+        # 不論私訊或群組，收到圖片皆先寫入快取（注意：因為容器重啟時記憶體會清空，若剛部署完請重新傳一次圖片）
         latest_image_cache[chat_id] = {
             "bytes": image_bytes,
             "timestamp": time.time()
@@ -224,7 +227,7 @@ def handle_image_message(event):
     except Exception as e:
         logger.error(f"[Image Error] {e}", exc_info=True)
         if source_type == "user":
-            send_line_reply(event.reply_token, f"我的眼睛業障重，圖片讀取失敗（{type(e).__name__}: {str(e)[:60]}）")
+            send_line_reply(event.reply_token, f"圖片剛存進腦袋，但 Google 伺服器塞車中（{type(e).__name__}），請直接打字問我這張圖要幹嘛！")
 
 def send_line_reply(reply_token, text):
     try:
